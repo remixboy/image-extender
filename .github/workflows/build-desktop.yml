@@ -1,0 +1,133 @@
+name: Build desktop app
+
+# Run it by hand: Actions tab -> "Build desktop app" -> "Run workflow".
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+          - os: macos-latest
+            name: Mac
+    runs-on: ${{ matrix.os }}
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the web app
+        run: npm ci
+
+      - name: Build the web app
+        run: npm run build
+
+      - name: Check the build is the "standalone" kind
+        shell: bash
+        run: |
+          if [ ! -f .next/standalone/server.js ]; then
+            echo "::error::.next/standalone/server.js is missing. Add output: 'standalone' to next.config.js."
+            exit 1
+          fi
+
+      - name: Install Electron
+        working-directory: desktop
+        run: npm install
+
+      - name: Package for Windows
+        if: matrix.name == 'Windows'
+        working-directory: desktop
+        run: npx electron-builder --win --x64 --publish never
+
+      - name: Package for Mac (Apple Silicon + Intel)
+        if: matrix.name == 'Mac'
+        working-directory: desktop
+        run: npx electron-builder --mac --dir --arm64 --x64 --publish never
+
+      - name: Test that the bundled server actually works
+        shell: bash
+        working-directory: desktop
+        run: |
+          if [ "${{ matrix.name }}" = "Windows" ]; then
+            SRC="dist/win-unpacked/resources/next-server"
+          else
+            APP="$(ls -d dist/mac*/*.app | head -1)"
+            SRC="$APP/Contents/Resources/next-server"
+          fi
+          test -f "$SRC/server.js" || { echo "::error::server.js not packaged"; exit 1; }
+          test -d "$SRC/.next/static" || { echo "::error::.next/static not packaged"; exit 1; }
+
+          # Run a copy so the real app bundle is left untouched.
+          TEST_DIR="$RUNNER_TEMP/smoke"
+          rm -rf "$TEST_DIR"; cp -R "$SRC" "$TEST_DIR"
+          cd "$TEST_DIR"
+          PORT=31999 HOSTNAME=127.0.0.1 node server.js > "$RUNNER_TEMP/server.log" 2>&1 &
+          PID=$!
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:31999 -o "$RUNNER_TEMP/page.html" && break
+            sleep 1
+          done
+          if [ ! -s "$RUNNER_TEMP/page.html" ]; then
+            echo "::error::Bundled server did not respond"; cat "$RUNNER_TEMP/server.log"; exit 1
+          fi
+          CSS="$(grep -o '/_next/static/[^"]*\.css' "$RUNNER_TEMP/page.html" | head -1)"
+          if [ -n "$CSS" ]; then
+            curl -sf "http://127.0.0.1:31999$CSS" -o /dev/null || { echo "::error::Styles failed to load ($CSS)"; exit 1; }
+          fi
+          # An empty request to an API route should get a polite "400 Missing anchor prompt",
+          # which proves the server-side routes are packaged too.
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d '{}' http://127.0.0.1:31999/api/scene-brief)"
+          if [ "$CODE" != "400" ]; then
+            echo "::error::API route check returned $CODE instead of 400"; cat "$RUNNER_TEMP/server.log"; exit 1
+          fi
+          kill $PID || true
+          echo "Bundled server works (page, styles and API routes)."
+
+      - name: Sign (free "ad-hoc" signature) and put the Mac apps in .dmg files
+        if: matrix.name == 'Mac'
+        working-directory: desktop
+        run: |
+          mkdir -p out
+          for APP in dist/mac*/*.app; do
+            case "$APP" in
+              *arm64*) KIND="AppleSilicon" ;;
+              *)       KIND="Intel" ;;
+            esac
+            codesign --force --deep --sign - "$APP"
+            STAGE="$RUNNER_TEMP/dmg-$KIND"
+            rm -rf "$STAGE"; mkdir -p "$STAGE"
+            ditto "$APP" "$STAGE/Image Extender.app"
+            ln -s /Applications "$STAGE/Applications"
+            hdiutil create -volname "Image Extender" -srcfolder "$STAGE" -ov -format UDZO "out/Image-Extender-Mac-$KIND.dmg"
+          done
+          ls -lh out
+
+      - name: Save the Windows files
+        if: matrix.name == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-Extender-Windows
+          path: |
+            desktop/dist/Image-Extender-Setup-*.exe
+            desktop/dist/Image-Extender-Portable-*.exe
+          if-no-files-found: error
+
+      - name: Save the Mac files
+        if: matrix.name == 'Mac'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-Extender-Mac
+          path: desktop/out/*.dmg
+          if-no-files-found: error
