@@ -21,18 +21,7 @@
       "electron-main.js",
       "package.json"
     ],
-    "extraResources": [
-      {
-        "from": "../.next/standalone",
-        "to": "next-server",
-        "filter": ["**/*"]
-      },
-      {
-        "from": "../.next/static",
-        "to": "next-server/.next/static",
-        "filter": ["**/*"]
-      }
-    ],
+    "afterPack": "./after-pack.js",
     "win": {
       "target": ["nsis", "portable"]
     },
